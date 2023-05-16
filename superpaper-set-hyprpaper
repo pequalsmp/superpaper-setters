@@ -1,0 +1,45 @@
+#!/usr/bin/env sh
+
+INPUT="$1"
+
+MONITORS="$(hyprctl monitors -j)"
+
+set_image() {
+	# superpaper re-uses images, so unload first
+	hyprctl hyprpaper unload "$2"
+
+	hyprctl hyprpaper preload "$2"
+	hyprctl hyprpaper wallpaper "$1,$(realpath "$2")"
+}
+
+# yes, Hyprland calls it a monitor, but it's really an output
+for output in $(echo "$MONITORS" | jq '.[].name' -r); do
+	output_wallpaper="$XDG_CACHE_HOME"/superpaper/hyprpaper/"$output"."${INPUT##*.}"
+
+	(
+		w="$(echo "$MONITORS" | jq '.[] | select(.name == "'"$output"'") | .width')"
+		h="$(echo "$MONITORS" | jq '.[] | select(.name == "'"$output"'") | .height')"
+		x="$(echo "$MONITORS" | jq '.[] | select(.name == "'"$output"'") | .x')"
+		y="$(echo "$MONITORS" | jq '.[] | select(.name == "'"$output"'") | .y')"
+
+		transform="$(echo "$MONITORS" | jq '.[] | select(.name == "'"$output"'") | .transform')"
+
+		# handle rotation
+		if [ "$transform" -eq 1 ] || [ "$transform" -eq 3 ]; then
+			temp_w="$w"
+			temp_h="$h"
+
+			w="$temp_h"
+			h="$temp_w"
+		fi
+
+		convert "$INPUT" -crop "$(printf '%dx%d+%d+%d' "$w" "$h" "$x" "$y")" "$output_wallpaper"
+	) &
+
+	set_image "$output" "$output_wallpaper"
+done
+
+wait
+
+# unload unused wallpapers
+hyprctl hyprpaper unload all

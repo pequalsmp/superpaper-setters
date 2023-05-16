@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+
+import getopt
+import json
+import os
+import pathlib
+import socket
+import struct
+import subprocess
+import sys
+from typing import Any
+
+IPC_MAGIC = b"i3-ipc"
+IPC_HEADER = "=6s I I"
+IPC_HEADER_SIZE = struct.calcsize(IPC_HEADER)
+
+if "SWAYSOCK" in os.environ:
+    SWAYSOCK = os.environ["SWAYSOCK"]
+else:
+    print("SWAYSOCK not set, are you running swaywm?")
+    sys.exit(1)
+
+
+def run_sway_socket_command(header, payload) -> Any:
+    """Communicate with Sway over Socket
+
+    run_sway_command sets up the socket and handles io
+    header is a struct packed object that cannot be null
+    payload is also a struct packed object, but can be null if it is not needed
+    """
+
+    if header is None or len(header) == 0:
+        return
+
+    sway_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+    try:
+        sway_socket.connect(SWAYSOCK)
+        if sway_socket.send(header, IPC_HEADER_SIZE) < 0:
+            print("Failed to send IPC header")
+        if payload is not None:
+            sway_socket.sendall(payload)
+
+        header_resp_raw = sway_socket.recv(IPC_HEADER_SIZE)
+        header_resp = struct.unpack(IPC_HEADER, header_resp_raw)
+        data_size = int(header_resp[1])
+        # unused so comment out for now
+        # msg_type = int(header_resp[2])
+        data = sway_socket.recv(data_size)
+    finally:
+        sway_socket.close()
+
+    return json.loads(data)
+
+
+def run_sway_command(cmd) -> Any:
+    """Run a string as Sway command"""
+    cmdsize = len(cmd)
+    msg = struct.pack(IPC_HEADER, IPC_MAGIC, cmdsize, 0)
+    payload = struct.pack("%ss" % cmdsize, cmd.encode())
+    return run_sway_socket_command(msg, payload)
+
+
+def get_outputs() -> Any:
+    """Get outputs in the current session"""
+    msg = struct.pack(IPC_HEADER, IPC_MAGIC, 0, 3)
+    data = run_sway_socket_command(msg, None)
+    # monitor_list = list()
+    # for monitor in data:
+    #     name = monitor['name']
+    #     monitor_list.append(name)
+    # return monitor_list
+    return data
+
+
+def post_process(wallpaper_backend: str) -> None:
+    """Run post-processing on the backend (if needed)"""
+    match wallpaper_backend:
+        case "swaybg":
+            # nothing to do
+            pass
+        case "wpaperd":
+            subprocess.run(["systemctl", "--user", "restart", "wpaperd.service"])
+        case _:
+            run_sway_command("reload")
+
+
+def set_background(output: str, background: str, wallpaper_backend: str) -> None:
+    """Set background, given a output and the image file
+
+    Multiple options are available, depending on the user setup
+    """
+    match wallpaper_backend:
+        case "swaybg":
+            set_background_swaybg(output, background)
+        case "wpaperd":
+            help = f"""You should set the following path in your config:
+
+            [{output}]
+            path = "{background}"
+
+            This program will automatically restart wpaperd, after
+            all the images have been generated.
+            """
+
+            print(help)
+        case _:
+            set_background_sway_ipc(output, background)
+
+
+def set_background_swaybg(output: str, background: str) -> None:
+    """Spawn swaybg for a specific output/background"""
+    # set as background
+    cmd = f"swaybg -o {output} -i {background}"
+
+    # swaybg runs in the foreground, don't wait
+    subprocess.Popen(
+        [cmd], shell=True, stdin=None, stdout=None, stderr=None, close_fds=True
+    )
+
+
+def set_background_sway_ipc(output: str, background: str) -> Any:
+    """Set output's wallpaper over IPC"""
+    cmd = f"output {output} background {background} fit"
+    return run_sway_command(cmd)
+
+
+def main(argv) -> None:
+    try:
+        options, args = getopt.getopt(argv, "hi:w:", ["input-file="])
+    except getopt.GetoptError:
+        print("superpaper-set-swaysock -i <inputfile>")
+        sys.exit(2)
+    for opt, arg in options:
+        if opt in ("-i", "--input-file"):
+            input_file = arg
+        if opt in ("-w", "--wallpaper-backend"):
+            wallpaper_backend = arg
+        elif opt == "-h":
+            print("superpaper-set-swaysock -i <input-file>")
+            print("OPTIONAL: -w [swaybg, wpaperd] - wallpaper backend")
+            sys.exit()
+
+    if not os.path.exists(input_file):
+        print("invalid input file")
+        sys.exit(1)
+
+    cache_dir = "{}/superpaper/sway".format(
+        os.getenv("XDG_CACHE_HOME", os.path.expanduser("~/.cache")),
+    )
+
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+
+    for output in get_outputs():
+        output_wallpaper = "{}/{}{}".format(
+            cache_dir, output["name"], pathlib.Path(input_file).suffix
+        )
+
+        coord = "{}x{}+{}+{}".format(
+            output["rect"]["width"],
+            output["rect"]["height"],
+            output["rect"]["x"],
+            output["rect"]["y"],
+        )
+
+        subprocess.run(["convert", input_file, "-crop", coord, output_wallpaper])
+
+        set_background(output["name"], output_wallpaper, wallpaper_backend)
+
+    post_process(wallpaper_backend)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
